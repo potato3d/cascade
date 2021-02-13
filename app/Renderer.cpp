@@ -1,0 +1,885 @@
+#include <app/Renderer.h>
+#include <glb/opengl.h>
+#include <glb/shader_program_builder.h>
+#include <glb/camera.h>
+#include <glb/framebuffer.h>
+#include <rvm/MaterialTable.h>
+#include <app/Color.h>
+#include <limits>
+
+#define BLEND_TRANSPARENT 0
+#define MEASURE_SPEED 0
+
+namespace app
+{
+	unsigned int Renderer::addExtraDrawable(const string& name, int colorID, const tess::triangle_mesh& mesh)
+	{
+		GLB_PRINT_GL_ERROR;
+		return addExtraDrawable(name, colorID, mat4::IDENTITY, mesh);
+	}
+
+	unsigned int Renderer::addExtraDrawable(const string& name, int colorID, const mat4& transform, const tess::triangle_mesh& mesh)
+	{
+		if(_loader.firstSceneDrawable < _loader.meshes.size())
+		{
+			throw std::exception();
+		}
+		++_loader.firstSceneDrawable;
+
+		mat4 transformNormal = transform.to_normal_matrix();
+		auto m = mesh;
+		for(auto& v : m.vertices)
+		{
+			v.position = transform.mul(v.position);
+			v.normal = transformNormal.mul3x3(v.normal);
+		}
+		GLB_PRINT_GL_ERROR;
+		return addDrawableData(name, colorID, m, AABB());
+	}
+
+	unsigned int Renderer::addSceneDrawable(const string& name, int colorID, const tess::triangle_mesh& mesh)
+	{
+		AABB bound;
+		for(const auto& v : mesh.vertices)
+		{
+			bound.expand(v.position);
+		}
+		_scene.bound.expand(bound);
+		GLB_PRINT_GL_ERROR;
+		return addDrawableData(name, colorID, mesh, bound);
+	}
+
+	unsigned int Renderer::addDrawableData(const string& name, int colorID, const tess::triangle_mesh& mesh, const AABB& bound)
+	{
+		DrawCmd cmd;
+		cmd.elementCount = mesh.elements.size();
+		cmd.instanceCount = 1;
+		cmd.firstElement = _loader.elementCount;
+		cmd.baseVertex = _loader.vertexCount;
+		cmd.baseInstance = _scene.cmds.size(); // for drawableID
+
+		_loader.vertexCount += mesh.vertices.size();
+		_loader.elementCount += mesh.elements.size();
+		_loader.meshes.push_back(mesh);
+		_loader.colorIDs.push_back(colorID);
+
+		_scene.cmds.push_back(cmd);
+		_scene.names.push_back(name);
+		_scene.states.push_back({{0, 0, 1}, bound});
+		_scene.vertexCounts.push_back(mesh.vertices.size());
+
+		GLB_PRINT_GL_ERROR;
+		return _scene.cmds.size()-1;
+	}
+
+	void Renderer::endLoad()
+	{
+
+		// duplicate scene to support rendering two schedules at the same time
+		_loader.lastSceneDrawable = _scene.cmds.size()-1;
+		_loader.colorIDs.insert(_loader.colorIDs.end(), _loader.colorIDs.begin(), _loader.colorIDs.end());
+
+		_scene.cmds.insert(_scene.cmds.end(), _scene.cmds.begin(), _scene.cmds.end());
+		_scene.vertexCounts.insert(_scene.vertexCounts.end(), _scene.vertexCounts.begin(), _scene.vertexCounts.end());
+		_scene.states.insert(_scene.states.end(), _scene.states.begin(), _scene.states.end());
+		for(unsigned int i = _loader.lastSceneDrawable+1; i < _scene.states.size(); ++i)
+		{
+			_scene.cmds.at(i).baseInstance = i; // adjust drawableID
+			_scene.states.at(i).visual.visible = false;
+		}
+
+		// --------
+
+		_scene.originalBound = _scene.bound;
+
+		io::print("drawables:", _loader.meshes.size());
+		io::print("triangles:", _loader.elementCount/3);
+
+		_gpu.colorIDs.init(_loader.colorIDs.size()*sizeof(unsigned int));
+		_gpu.colorIDs.setData(_loader.colorIDs.size(), _loader.colorIDs.data());
+		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, _gpu.colorIDs.getID());
+		_loader.colorIDs.clear();
+		_loader.colorIDs.shrink_to_fit();
+
+		vector<mat34> t(_scene.cmds.size(), mat34(mat4::IDENTITY));
+		_gpu.transforms.init(t.size()*sizeof(mat34));
+		_gpu.transforms.setData(t.size(), t.data());
+		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, _gpu.transforms.getID());
+
+		vector<unsigned int> d(_scene.cmds.size());
+		for(unsigned int i = 0; i < d.size(); ++i)
+		{
+			d.at(i) = i;
+		}
+		_gpu.drawableIDs.init(d.size()*sizeof(unsigned int));
+		_gpu.drawableIDs.setData(d.size(), d.data());
+
+		_cpuHighlightModes.resize(_scene.cmds.size());
+		for(auto& i : _cpuHighlightModes)
+		{
+			i = 0.0f;
+		}
+		_gpu.highlightModes.init(_cpuHighlightModes.size()*sizeof(float));
+		_gpu.highlightModes.setData(_cpuHighlightModes.size(), _cpuHighlightModes.data());
+
+		_gpu.vbo.init(_loader.vertexCount*sizeof(tess::vertex));
+
+		Buffer ebo;
+		ebo.init(_loader.elementCount*sizeof(tess::element));
+
+		for(const auto& m : _loader.meshes)
+		{
+			_gpu.vbo.addData(m.vertices.size(), m.vertices.data());
+			ebo.addData(m.elements.size(), m.elements.data());
+		}
+		_loader.meshes.clear();
+		_loader.meshes.shrink_to_fit();
+
+		unsigned int meshVboIndex = 0;
+		unsigned int positionIndex = 0;
+		unsigned int normalIndex = 1;
+		unsigned int drawableIdVboIndex = 1;
+		unsigned int drawableIdIndex = 2;
+		unsigned int highlightModeVboIndex = 2;
+		unsigned int highlightModeIndex = 3;
+
+		glCreateVertexArrays(1, &_gpu.vao);
+
+		glVertexArrayVertexBuffer(_gpu.vao, meshVboIndex, _gpu.vbo.getID(), 0, sizeof(tess::vertex));
+
+		glEnableVertexArrayAttrib(_gpu.vao, positionIndex);
+		glVertexArrayAttribBinding(_gpu.vao, positionIndex, meshVboIndex);
+		glVertexArrayAttribFormat(_gpu.vao, positionIndex, 3, GL_FLOAT, GL_FALSE, 0);
+
+		glEnableVertexArrayAttrib(_gpu.vao, normalIndex);
+		glVertexArrayAttribBinding(_gpu.vao, normalIndex, meshVboIndex);
+		glVertexArrayAttribFormat(_gpu.vao, normalIndex, 3, GL_FLOAT, GL_FALSE, sizeof(vec3));
+
+		glVertexArrayVertexBuffer(_gpu.vao, drawableIdVboIndex, _gpu.drawableIDs.getID(), 0, sizeof(unsigned int));
+		glVertexArrayBindingDivisor(_gpu.vao, drawableIdVboIndex, 1);
+
+		glEnableVertexArrayAttrib(_gpu.vao, drawableIdIndex);
+		glVertexArrayAttribBinding(_gpu.vao, drawableIdIndex, drawableIdVboIndex);
+		glVertexArrayAttribIFormat(_gpu.vao, drawableIdIndex, 1, GL_UNSIGNED_INT, 0);
+
+		glVertexArrayVertexBuffer(_gpu.vao, highlightModeVboIndex, _gpu.highlightModes.getID(), 0, sizeof(float));
+		glVertexArrayBindingDivisor(_gpu.vao, highlightModeVboIndex, 1);
+
+		glEnableVertexArrayAttrib(_gpu.vao, highlightModeIndex);
+		glVertexArrayAttribBinding(_gpu.vao, highlightModeIndex, highlightModeVboIndex);
+		glVertexArrayAttribFormat(_gpu.vao, highlightModeIndex, 1, GL_FLOAT, GL_FALSE, 0);
+
+		glVertexArrayElementBuffer(_gpu.vao, ebo.getID());
+
+		_visible.handles.reserve(_scene.cmds.size());
+		_visible.cmds.reserve(_scene.cmds.size());
+		_visible.opaqueCount = 0;
+		_visible.transparentCount = 0;
+
+		unsigned int lineVboIndex = 0;
+		glCreateVertexArrays(1, &_lineGPU.vao);
+
+		glVertexArrayVertexBuffer(_lineGPU.vao, lineVboIndex, _lineGPU.vbo.getID(), 0, sizeof(vec3));
+
+		glEnableVertexArrayAttrib(_lineGPU.vao, positionIndex);
+		glVertexArrayAttribBinding(_lineGPU.vao, positionIndex, lineVboIndex);
+		glVertexArrayAttribFormat(_lineGPU.vao, positionIndex, 3, GL_FLOAT, GL_FALSE, 0);
+
+		glVertexArrayVertexBuffer(_lineGPU.vao, drawableIdVboIndex, _gpu.drawableIDs.getID(), 0, sizeof(unsigned int));
+		glVertexArrayBindingDivisor(_lineGPU.vao, drawableIdVboIndex, 1);
+
+		glEnableVertexArrayAttrib(_lineGPU.vao, drawableIdIndex);
+		glVertexArrayAttribBinding(_lineGPU.vao, drawableIdIndex, drawableIdVboIndex);
+		glVertexArrayAttribIFormat(_lineGPU.vao, drawableIdIndex, 1, GL_UNSIGNED_INT, 0);
+
+		GLB_PRINT_GL_ERROR;
+
+
+//		unsigned int sizeSize = sizeof(_scene) + _scene.names.size() * 50 + _scene.states.size() * sizeof(State) + _scene.cmds.size() * sizeof(DrawCmd) + _scene.vertexCounts.size() * sizeof(unsigned int);
+//		unsigned int visibleSize = sizeof(_visible) + _visible.handles.size() * sizeof(Handle) + _visible.cmds.size() * sizeof(DrawCmd);
+//		unsigned int gpuSize = _gpu.vbo.getCurrSizeBytes() + _gpu.colors.getCurrSizeBytes() + _gpu.colorIDs.getCurrSizeBytes() + _gpu.transforms.getCurrSizeBytes() +
+//							   _gpu.drawableIDs.getCurrSizeBytes() + _gpu.highlightModes.getCurrSizeBytes();
+
+//		io::print("sizeSize:", sizeSize);
+//		io::print("visibleSize:", visibleSize);
+//		io::print("gpuSize:", gpuSize);
+
+//		io::print("_gpu.vbo.getCurrSizeBytes():", _gpu.vbo.getCurrSizeBytes());
+//		io::print("_gpu.colors.getCurrSizeBytes():", _gpu.colors.getCurrSizeBytes());
+//		io::print("_gpu.colorIDs.getCurrSizeBytes():", _gpu.colorIDs.getCurrSizeBytes());
+//		io::print("_gpu.transforms.getCurrSizeBytes():", _gpu.transforms.getCurrSizeBytes());
+//		io::print("_gpu.drawableIDs.getCurrSizeBytes():", _gpu.drawableIDs.getCurrSizeBytes());
+//		io::print("_gpu.highlightModes.getCurrSizeBytes():", _gpu.highlightModes.getCurrSizeBytes());
+
+
+	}
+
+	void Renderer::setDrawablesHighlight(const unsigned int* drawableIDs, unsigned int count, float mode, bool enable)
+	{
+		if(count == 0)
+		{
+			return;
+		}
+		unsigned int lowestID = -1;
+		unsigned int highestID = 0;
+		for(unsigned int i = 0; i < count; ++i)
+		{
+			unsigned int id = drawableIDs[i];
+			lowestID = std::min(lowestID, id);
+			highestID = std::max(highestID, id);
+			auto& currMode = _cpuHighlightModes.at(id);
+			if(enable)
+			{
+				currMode = mode;
+			}
+			else if(currMode == mode)
+			{
+				currMode = 0.0f;
+			}
+		}
+		glNamedBufferSubData(_gpu.highlightModes.getID(), lowestID*sizeof(float), (highestID-lowestID+1)*sizeof(float), _cpuHighlightModes.data()+lowestID);
+		GLB_PRINT_GL_ERROR;
+	}
+
+	unsigned int Renderer::addLineDrawable(int colorID, const vec3& p0, const vec3& p1)
+	{
+		DrawArraysCmd cmd;
+		cmd.baseInstance = _lineScene.cmds.size(); // for drawableID
+		cmd.count = 2;
+		cmd.first = _lineGPU.vbo.getCount()*2;
+		cmd.instanceCount = 1;
+		_lineScene.cmds.push_back(cmd);
+
+		AABB bound;
+		bound.expand(p0);
+		bound.expand(p1);
+
+		_lineScene.states.push_back({{0, 0, 1}, bound});
+
+		if(!_lineGPU.colorIDs.addData(1, &colorID))
+		{
+			throw std::exception();
+		}
+
+		LineMesh lm{p0, p1};
+		if(!_lineGPU.vbo.addData(1, &lm))
+		{
+			throw std::exception();
+		}
+
+		GLB_PRINT_GL_ERROR;
+		return _lineScene.cmds.size() - 1;
+	}
+
+	void Renderer::setLineDrawableVisible(unsigned int drawableID, bool visible)
+	{
+		_lineScene.states.at(drawableID).visual.visible = visible;
+		GLB_PRINT_GL_ERROR;
+	}
+
+	void Renderer::setLineDrawableStipple(unsigned int drawableID, bool stipple)
+	{
+		_lineScene.states.at(drawableID).visual.stipple = stipple;
+		GLB_PRINT_GL_ERROR;
+	}
+
+	void Renderer::setLineDrawablePoints(unsigned int drawable, const vec3& p0, const vec3& p1)
+	{
+		LineMesh lm{p0, p1};
+		_lineGPU.vbo.write(drawable*sizeof(LineMesh), sizeof(LineMesh), &lm);
+
+		AABB bound;
+		bound.expand(p0);
+		bound.expand(p1);
+		_lineScene.states.at(drawable).bound = bound;
+		GLB_PRINT_GL_ERROR;
+	}
+
+	unsigned int Renderer::addColor(float r, float g, float b)
+	{
+		unsigned int id = _gpu.colors.getCount();
+		Color c = {(unsigned char)(r*255.0f), (unsigned char)(g*255.0f), (unsigned char)(b*255.0f), 255};
+		_gpu.colors.addData(1, &c);
+		GLB_PRINT_GL_ERROR;
+		return id;
+	}
+
+	void Renderer::setDrawableVisible(unsigned int drawableID, bool visible)
+	{
+		_scene.states.at(drawableID).visual.visible = visible;
+		GLB_PRINT_GL_ERROR;
+		emit drawableVisiblityChanged(drawableID, visible);
+	}
+
+	void Renderer::setDrawableTransform(unsigned int drawableID, const mat4& transform)
+	{
+		beginTransformBatch();
+		setBatchDrawableTransform(drawableID, transform);
+		endTransformBatch();
+		GLB_PRINT_GL_ERROR;
+	}
+
+	unsigned int Renderer::getDrawableColorID(unsigned int drawableID)
+	{
+		unsigned int id = 0;
+		_gpu.colorIDs.read(drawableID*sizeof(unsigned int), sizeof(unsigned int), &id);
+		GLB_PRINT_GL_ERROR;
+		return id;
+	}
+
+	void Renderer::setDrawableColorID(unsigned int drawableID, unsigned int colorID)
+	{
+		_gpu.colorIDs.write(drawableID*sizeof(unsigned int), sizeof(unsigned int), &colorID);
+		emit drawableColorChanged(drawableID, colorID);
+		GLB_PRINT_GL_ERROR;
+	}
+
+	void Renderer::setDrawableTransparent(unsigned int drawableID, bool transparent)
+	{
+		_scene.states.at(drawableID).visual.transparent = transparent;
+		GLB_PRINT_GL_ERROR;
+		emit drawableTransparencyChanged(drawableID, transparent);
+	}
+
+	const AABB& Renderer::getDrawableBounds(unsigned int drawableID)
+	{
+		auto itr = _dirtyDrawables.find(drawableID);
+		if(itr != _dirtyDrawables.end())
+		{
+			vector<tess::vertex> vertices(_scene.vertexCounts.at(drawableID));
+			_gpu.vbo.read(_scene.cmds.at(drawableID).baseVertex*sizeof(tess::vertex), vertices.size()*sizeof(tess::vertex), vertices.data());
+
+			AABB bound;
+			for(const auto& v : vertices)
+			{
+				bound.expand(itr->mul(v.position));
+			}
+			_scene.states.at(drawableID).bound = bound;
+
+			_dirtyDrawables.remove(drawableID);
+
+			_sceneBoundsDirty = true;
+		}
+		GLB_PRINT_GL_ERROR;
+		return _scene.states.at(drawableID).bound;
+	}
+
+	const string& Renderer::getDrawableName(unsigned int drawableID)
+	{
+		GLB_PRINT_GL_ERROR;
+		return _scene.names.at(drawableID);
+	}
+
+	void Renderer::beginTransformBatch()
+	{
+		// empty
+	}
+
+	void Renderer::setBatchDrawableTransform(unsigned int drawableID, const mat4& transform)
+	{
+		_gpu.transforms.write(drawableID*sizeof(mat34), sizeof(mat34), mat34(transform).data);
+
+		if(drawableID >= _loader.firstSceneDrawable)
+		{
+			_dirtyDrawables.insert(drawableID, transform);
+		}
+
+		emit drawableTransformChanged(drawableID, transform);
+		GLB_PRINT_GL_ERROR;
+	}
+
+	void Renderer::endTransformBatch()
+	{
+		// empty
+	}
+
+	unsigned int Renderer::pickDrawable(unsigned int x, unsigned int y)
+	{
+		union
+		{
+			float f;
+			unsigned int ui;
+		} drawableID;
+		_fbuffer->read_color_pixels(_pickBufferID, glb::type_float, x, y, 1, 1, &drawableID.f);
+		GLB_PRINT_GL_ERROR;
+		return drawableID.ui;
+	}
+
+	unsigned int Renderer::getFirstSceneDrawable()
+	{
+		GLB_PRINT_GL_ERROR;
+		return _loader.firstSceneDrawable;
+	}
+
+	const AABB& Renderer::getSceneOriginalBounds()
+	{
+		GLB_PRINT_GL_ERROR;
+		return _scene.originalBound;
+	}
+
+	const AABB& Renderer::getSceneBounds()
+	{
+		if(!_dirtyDrawables.isEmpty())
+		{
+			auto keys = _dirtyDrawables.keys();
+			for(auto d : keys)
+			{
+				getDrawableBounds(d);
+			}
+
+			_sceneBoundsDirty = true;
+		}
+
+		if(_sceneBoundsDirty)
+		{
+			_scene.bound = AABB();
+			for(const auto& s : _scene.states)
+			{
+				_scene.bound.expand(s.bound);
+			}
+		}
+		GLB_PRINT_GL_ERROR;
+		return _scene.bound;
+	}
+
+	unsigned int Renderer::getLastSceneDrawable()
+	{
+		GLB_PRINT_GL_ERROR;
+		return _loader.lastSceneDrawable;
+	}
+
+	bool Renderer::isDuplicateDrawable(unsigned int drawableID)
+	{
+		GLB_PRINT_GL_ERROR;
+		return drawableID > getLastSceneDrawable();
+	}
+
+	unsigned int Renderer::getOriginalDrawableID(unsigned int duplicateDrawableID)
+	{
+		GLB_PRINT_GL_ERROR;
+		if(duplicateDrawableID <= getLastSceneDrawable())
+		{
+			return duplicateDrawableID;
+		}
+		return duplicateDrawableID - getLastSceneDrawable() - 1;
+	}
+
+	unsigned int Renderer::getDuplicateDrawableID(unsigned int drawableID)
+	{
+		GLB_PRINT_GL_ERROR;
+		if(drawableID > getLastSceneDrawable())
+		{
+			return drawableID;
+		}
+		return drawableID + getLastSceneDrawable() + 1;
+	}
+
+	bool Renderer::isDrawableVisible(unsigned int drawableID)
+	{
+		GLB_PRINT_GL_ERROR;
+		return _scene.states.at(drawableID).visual.visible;
+	}
+
+	bool Renderer::isDrawableTransparent(unsigned int drawableID)
+	{
+		GLB_PRINT_GL_ERROR;
+		return _scene.states.at(drawableID).visual.transparent;
+	}
+
+	mat4 Renderer::getView()
+	{
+		GLB_PRINT_GL_ERROR;
+		return _camera->get_view();
+	}
+
+	mat4 Renderer::getProjection()
+	{
+		GLB_PRINT_GL_ERROR;
+		return _camera->get_projection();
+	}
+
+	unsigned int Renderer::getScreenWidth()
+	{
+		GLB_PRINT_GL_ERROR;
+		return _fbuffer->get_width();
+	}
+
+	unsigned int Renderer::getScreenHeight()
+	{
+		GLB_PRINT_GL_ERROR;
+		return _fbuffer->get_height();
+	}
+
+	float Renderer::getTransparencyLevel()
+	{
+		GLB_PRINT_GL_ERROR;
+		return _transparencyAlpha;
+	}
+
+	void Renderer::setTransparencyLevel(float alpha)
+	{
+		GLB_PRINT_GL_ERROR;
+		_transparencyAlpha = alpha;
+	}
+
+	bool Renderer::initialize(glb::framebuffer& fbuffer, glb::camera& cam)
+	{
+		rvm::MaterialTable mt;
+		_gpu.colors.init(1024*sizeof(Color));
+		for(int i = 0; i < mt.getNumberMaterials(); ++i)
+		{
+			const auto m = mt.getMaterial(i);
+			Color c;
+			c.r = m.diffuseColor[0]*255.0f;
+			c.g = m.diffuseColor[1]*255.0f;
+			c.b = m.diffuseColor[2]*255.0f;
+			c.a = 255;
+			_gpu.colors.addData(1, &c);
+		}
+		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, _gpu.colors.getID());
+
+		glb::shader_program_builder spb;
+		spb.begin();
+		if(!spb.add_file(glb::shader_vertex, "../shaders/schedule3d/draw.vert"))
+		{
+			return false;
+		}
+		if(!spb.add_file(glb::shader_fragment, "../shaders/schedule3d/draw.frag"))
+		{
+			return false;
+		}
+		if(!spb.end())
+		{
+			return false;
+		}
+		auto draw_shader = spb.get_shader_program();
+		_gpu.drawProgram = draw_shader.get_id();
+
+		glBindBufferBase(GL_UNIFORM_BUFFER, 0, cam.get_uniform_buffer().get_id());
+		glUniformBlockBinding(_gpu.drawProgram, 0, 0);
+
+		fbuffer.set_use_textures(true);
+		fbuffer.set_clear_color(0, 1,1,1);
+
+		_pickBufferID = fbuffer.add_color_buffer();
+		fbuffer.set_color_format(_pickBufferID, glb::internal_format_rg32f);
+		fbuffer.set_clear_color(_pickBufferID, 0,0,0,0);
+
+		auto transparentID = fbuffer.add_color_buffer();
+		fbuffer.set_color_format(transparentID, glb::internal_format_rgba8);
+		fbuffer.set_clear_color(transparentID, 0,0,0,0);
+
+		_fbuffer = &fbuffer;
+
+		glb::shader_program_builder cspb;
+		cspb.begin();
+		if(!cspb.add_file(glb::shader_geometry, "../shaders/depth_mipmap.geom"))
+		{
+			return false;
+		}
+		if(!cspb.add_file(glb::shader_vertex, "../shaders/depth_mipmap.vert"))
+		{
+			return false;
+		}
+		if(!cspb.add_file(glb::shader_fragment, "../shaders/schedule3d/compose_image.frag"))
+		{
+			return false;
+		}
+		if(!cspb.end())
+		{
+			return false;
+		}
+		auto compose_draw_shader = cspb.get_shader_program();
+		_gpu.composeProgram = compose_draw_shader.get_id();
+
+		_camera = &cam;
+
+		_lineGPU.vbo.init(1024*1024*8);
+		_lineGPU.colorIDs.init(1024*1024*4);
+		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, _lineGPU.colorIDs.getID());
+
+		glb::shader_program_builder lspb;
+		lspb.begin();
+		if(!lspb.add_file(glb::shader_vertex, "../shaders/schedule3d/line_draw.vert"))
+		{
+			return false;
+		}
+		if(!lspb.add_file(glb::shader_fragment, "../shaders/schedule3d/line_draw.frag"))
+		{
+			return false;
+		}
+		if(!lspb.end())
+		{
+			return false;
+		}
+		_lineGPU.drawProgram = lspb.get_shader_program().get_id();
+		glUniformBlockBinding(_lineGPU.drawProgram, 0, 0);
+
+		glLineWidth(3.0f);
+		glLineStipple(4, 0xAAAA);
+
+		GLB_PRINT_GL_ERROR;
+
+		glGenQueries(3, _gpuTimers);
+
+		GLB_PRINT_GL_ERROR;
+
+		return true;
+	}
+
+	bool Renderer::finalize()
+	{
+		GLB_PRINT_GL_ERROR;
+		return true;
+	}
+
+	void Renderer::render()
+	{
+#if MEASURE_SPEED
+bl::timer t;
+#endif
+
+
+		emit beforeRender();
+
+		_camPos = _camera->get_view().inverse() * vec3::ZERO;
+
+		GLB_PRINT_GL_ERROR;
+
+#if MEASURE_SPEED
+t.restart();
+#endif
+
+		// collect scene visible
+		_visible.handles.clear();
+		_visible.opaqueCount = 0;
+		_visible.transparentCount = 0;
+		_visible.extraTransparentCount = 0;
+		for(unsigned int i = 0; i < _scene.states.size(); ++i)
+		{
+			auto s = _scene.states.at(i);
+			if(!s.visual.visible || _isCulled(s.bound))
+			{
+				continue;
+			}
+			bool isExtraTransparent = i < _loader.firstSceneDrawable && s.visual.transparent;
+#if BLEND_TRANSPARENT
+			_visible.handles.push_back({{_getDepth(s.bound), isExtraTransparent, s.visual.transparent}, i}); // TODO: use this when blending between transparent
+#else
+			_visible.handles.emplace_back(0, isExtraTransparent, (unsigned int)s.visual.transparent, i);
+#endif
+			_visible.transparentCount += !isExtraTransparent && s.visual.transparent;
+			_visible.extraTransparentCount += isExtraTransparent;
+		}
+		_visible.opaqueCount = _visible.handles.size() - _visible.transparentCount - _visible.extraTransparentCount;
+
+#if MEASURE_SPEED
+double cpuCollectTime = t.nsec(); t.restart();
+#endif
+
+		GLB_PRINT_GL_ERROR;
+
+		// sort scene visible
+		std::sort(_visible.handles.begin(), _visible.handles.end());
+
+#if MEASURE_SPEED
+double cpuSortTime = t.nsec(); t.restart();
+#endif
+
+		_visible.cmds.clear();
+		for(unsigned int i = 0; i < _visible.handles.size(); ++i)
+		{
+			auto h = _visible.handles.at(i);
+			_visible.cmds.push_back(_scene.cmds.at(h.drawableID));
+		}
+
+#if MEASURE_SPEED
+double cpuGatherTime = t.nsec(); t.restart();
+#endif
+
+		GLB_PRINT_GL_ERROR;
+
+		// collect line visible
+		_lineVisible.smoothCmds.clear();
+		_lineVisible.stippleCmds.clear();
+		for(unsigned int i = 0; i < _lineScene.states.size(); ++i)
+		{
+			auto s = _lineScene.states.at(i);
+			if(!s.visual.visible || _isCulled(s.bound))
+			{
+				continue;
+			}
+			if(s.visual.stipple)
+			{
+				_lineVisible.stippleCmds.push_back(_lineScene.cmds.at(i));
+			}
+			else
+			{
+				_lineVisible.smoothCmds.push_back(_lineScene.cmds.at(i));
+			}
+		}
+
+#if MEASURE_SPEED
+cpuCollectTime += t.nsec();
+#endif
+
+		GLB_PRINT_GL_ERROR;
+
+#if MEASURE_SPEED
+t.restart();
+glBeginQuery(GL_TIME_ELAPSED, _gpuTimers[0]);
+#endif
+
+		// setup opaque output
+		unsigned int opaqueDrawBuffers[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+		glDrawBuffers(2, opaqueDrawBuffers);
+
+		// prepare to draw lines
+		glBindVertexArray(_lineGPU.vao);
+		glUseProgram(_lineGPU.drawProgram);
+
+		GLB_PRINT_GL_ERROR;
+
+		// draw smooth lines
+		if(!_lineVisible.smoothCmds.empty())
+		{
+			glMultiDrawArraysIndirect(GL_LINES, _lineVisible.smoothCmds.data(), _lineVisible.smoothCmds.size(), 0);
+		}
+
+		GLB_PRINT_GL_ERROR;
+
+		// draw stipple lines
+		if(!_lineVisible.stippleCmds.empty())
+		{
+			glEnable(GL_LINE_STIPPLE);
+			glMultiDrawArraysIndirect(GL_LINES, _lineVisible.stippleCmds.data(), _lineVisible.stippleCmds.size(), 0);
+			glDisable(GL_LINE_STIPPLE);
+		}
+
+		GLB_PRINT_GL_ERROR;
+
+		// prepare to draw scene
+		glBindVertexArray(_gpu.vao);
+		glUseProgram(_gpu.drawProgram);
+
+		GLB_PRINT_GL_ERROR;
+
+		// draw scene opaque
+		if(_visible.opaqueCount)
+		{
+			glProgramUniform1f(_gpu.drawProgram, 0, 1.0f);
+			glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, _visible.cmds.data(), _visible.opaqueCount, 0);
+		}
+
+		GLB_PRINT_GL_ERROR;
+
+#if MEASURE_SPEED
+glEndQuery(GL_TIME_ELAPSED);
+glBeginQuery(GL_TIME_ELAPSED, _gpuTimers[1]);
+#endif
+
+		// setup transparent output
+
+		// with picking (need to change shader as well)
+//		unsigned int transparentDrawBuffers[] = {GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT1};
+//		glDrawBuffers(2, transparentDrawBuffers);
+
+		// without picking
+#if BLEND_TRANSPARENT
+		unsigned int transparentDrawBuffers[] = {GL_COLOR_ATTACHMENT0};
+#else
+		unsigned int transparentDrawBuffers[] = {GL_COLOR_ATTACHMENT2};
+#endif
+		glDrawBuffers(1, transparentDrawBuffers);
+
+		glProgramUniform1f(_gpu.drawProgram, 0, _transparencyAlpha);
+		glBindTextureUnit(0, _fbuffer->get_color_buffer_name(1));
+
+		GLB_PRINT_GL_ERROR;
+
+		// draw scene transparent
+		if(_visible.transparentCount)
+		{
+#if BLEND_TRANSPARENT
+			glEnable(GL_BLEND);
+			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+			glDepthMask(GL_FALSE);
+#endif
+			glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, _visible.cmds.data() + _visible.opaqueCount, _visible.transparentCount, 0);
+#if BLEND_TRANSPARENT
+			glDepthMask(GL_TRUE);
+			glDisable(GL_BLEND);
+#endif
+		}
+
+		GLB_PRINT_GL_ERROR;
+
+		unsigned int extraTransparentDrawBuffers[] = {GL_COLOR_ATTACHMENT0};
+		glDrawBuffers(1, extraTransparentDrawBuffers);
+
+		GLB_PRINT_GL_ERROR;
+
+		// draw extra transparent
+		if(_visible.extraTransparentCount)
+		{
+			glEnable(GL_BLEND);
+			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+//			glDepthMask(GL_FALSE);
+			glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, _visible.cmds.data() + _visible.opaqueCount + _visible.transparentCount, _visible.extraTransparentCount, 0);
+//			glDepthMask(GL_TRUE);
+			glDisable(GL_BLEND);
+		}
+
+		GLB_PRINT_GL_ERROR;
+
+#if MEASURE_SPEED
+glEndQuery(GL_TIME_ELAPSED);
+glBeginQuery(GL_TIME_ELAPSED, _gpuTimers[2]);
+#endif
+
+		// compose final image
+		glDrawBuffer(GL_COLOR_ATTACHMENT0);
+		glDisable(GL_DEPTH_TEST);
+		glDepthMask(GL_FALSE);
+		glUseProgram(_gpu.composeProgram);
+		glBindTextureUnit(0, _fbuffer->get_color_buffer_name(0));
+		glBindTextureUnit(1, _fbuffer->get_color_buffer_name(1));
+		glBindTextureUnit(2, _fbuffer->get_color_buffer_name(2));
+		glBindTextureUnit(3, _fbuffer->get_depth_buffer_name());
+		glDrawArrays(GL_POINTS, 0, 1);
+		glDepthMask(GL_TRUE);
+		glEnable(GL_DEPTH_TEST);
+
+		GLB_PRINT_GL_ERROR;
+
+#if MEASURE_SPEED
+glEndQuery(GL_TIME_ELAPSED);
+
+double cpuDrawAndComposeTime = t.nsec();
+
+unsigned int gpuTimes[3] = {0, 0, 0};
+glGetQueryObjectuiv(_gpuTimers[0], GL_QUERY_RESULT, &gpuTimes[0]);
+glGetQueryObjectuiv(_gpuTimers[1], GL_QUERY_RESULT, &gpuTimes[1]);
+glGetQueryObjectuiv(_gpuTimers[2], GL_QUERY_RESULT, &gpuTimes[2]);
+
+io::print("cpuCollectTime:", cpuCollectTime*1e-6);
+io::print("cpuSortTime:", cpuSortTime*1e-6);
+io::print("cpuGatherTime:", cpuGatherTime*1e-6);
+io::print("cpuDrawAndComposeTime:", cpuDrawAndComposeTime*1e-6);
+io::print("gpuDrawOpaque:", (double)gpuTimes[0]*1e-6);
+io::print("gpuDrawTransparent:", (double)gpuTimes[1]*1e-6);
+io::print("gpuDrawCompose:", (double)gpuTimes[2]*1e-6);
+io::print("---------------------------------------------");
+#endif
+	}
+
+	bool Renderer::_isCulled(const AABB& /*bound*/)
+	{
+		return false;
+	}
+
+	unsigned int Renderer::_getDepth(const AABB& bound)
+	{
+		return -(bound.getCenter() - _camPos).length_squared();
+	}
+}
